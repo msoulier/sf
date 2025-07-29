@@ -9,19 +9,58 @@ package main
 // shell metachars to underscores
 // when all done, translate multiple, adjacent underscores to a single one
 import (
-	"fmt"
 	"path/filepath"
 	"io/fs"
 	"os"
 	"strings"
 	"regexp"
+	"github.com/op/go-logging"
+	"flag"
+	"bufio"
+	"fmt"
 )
 
-func clean_name(path string) string {
-	fmt.Printf("clean_name: path is %s\n", path)
+var (
+	log *logging.Logger = nil
+	debug = false
+	confirm = false
+	args []string
+)
+
+func init() {
+	flag.BoolVar(&debug, "d", false, "Debug logging")
+	flag.BoolVar(&confirm, "c", false, "Confirm all moves")
+	flag.Parse()
+	args = flag.Args()
+
+	format := logging.MustStringFormatter(
+		`%{time:2006-01-02 15:04:05.000-0700} %{level} [%{shortfile}] %{message}`,
+	)
+	stderrBackend := logging.NewLogBackend(os.Stderr, "", 0)
+	stderrFormatter := logging.NewBackendFormatter(stderrBackend, format)
+	stderrBackendLevelled := logging.AddModuleLevel(stderrFormatter)
+	logging.SetBackend(stderrBackendLevelled)
+	if debug {
+			stderrBackendLevelled.SetLevel(logging.DEBUG, "sf")
+	} else {
+			stderrBackendLevelled.SetLevel(logging.INFO, "sf")
+	}
+	log = logging.MustGetLogger("sf")
+
+	if len(args) < 1 {
+		log.Errorf("Usage: %s <path/files>", os.Args[0])
+		flag.PrintDefaults()
+		os.Exit(1)
+	}
+}
+
+func clean_name(path string) (string, bool) {
+	log.Debugf("clean_name: path is %s", path)
+	changed := false
 	base := filepath.Base(path)
 	dir := filepath.Dir(path)
-	fmt.Printf("basename is %s\n", base)
+	log.Debugf("basename is %s", base)
+	origname := base
 
 	// All lower-case.
 	base = strings.ToLower(base)
@@ -38,32 +77,59 @@ func clean_name(path string) string {
 	mult_underscores_pat := regexp.MustCompile("_+")
 	base = mult_underscores_pat.ReplaceAllLiteralString(base, "_")
 
-	return filepath.Join(dir, base)
+	if strings.Compare(origname, base) == 0 {
+		changed = false
+	} else {
+		changed = true
+	}
+
+	return filepath.Join(dir, base), changed
 }
 
 func main() {
-	if len(os.Args) < 2 {
-		fmt.Fprintf(os.Stderr, "Usage: %s <path/files>\n", os.Args[0])
-		os.Exit(1)
-	}
-	for _, path := range os.Args[1:] {
-		fmt.Printf("%s\n", path)
+	stdin_reader := bufio.NewReader(os.Stdin)
+	stdout_writer := bufio.NewWriter(os.Stdout)
+
+	for _, path := range args {
+		log.Debugf("%s", path)
 		filepath.Walk(path, func(fpath string, info fs.FileInfo, err error) error {
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Walk error: %s\n", err)
+				log.Errorf("Walk error: %s", err)
 				return fs.SkipDir
 			}
-			fmt.Printf("fpath is %s\n", fpath)
+			log.Debugf("fpath is %s", fpath)
 			if info.IsDir() {
-				fmt.Printf("%s is a directory\n", fpath)
+				log.Debugf("%s is a directory", fpath)
 				// FIXME switches to control directory renaming behaviour
 			} else {
-				newname := clean_name(fpath)
-				fmt.Printf("newname is %s\n", newname)
-				err := os.Rename(fpath, newname)
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "ERROR in rename from %s to %s: %s", fpath, newname, err)
-					// For now, continue processing
+				newname, changed := clean_name(fpath)
+				log.Debugf("newname is %s", newname)
+				if changed {
+					log.Debugf("===> filename has changed, need to rename")
+					if confirm {
+						_, err := stdout_writer.WriteString(fmt.Sprintf("Plan to rename %s to %s. Ok? [y/N] ", fpath, newname))
+						if err != nil {
+							log.Errorf("%s", err)
+							os.Exit(1)
+						}
+						stdout_writer.Flush()
+						line, err := stdin_reader.ReadString('\n')
+						if err != nil {
+							log.Errorf("%s", err)
+							os.Exit(1)
+						}
+						if line[0] != 'y' && line[0] != 'Y' {
+							log.Debug("skipping based on user response")
+							return fs.SkipDir
+						}
+					}
+					err := os.Rename(fpath, newname)
+					if err != nil {
+						log.Errorf("ERROR in rename from %s to %s: %s", fpath, newname, err)
+						// For now, continue processing
+					}
+				} else {
+					log.Debugf("===> no change")
 				}
 			}
 			return nil
